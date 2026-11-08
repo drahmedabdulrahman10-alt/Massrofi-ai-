@@ -1,0 +1,604 @@
+package com.example.data.repository
+
+import com.example.data.backup.BackupExportManager
+import com.example.data.backup.BackupPayload
+import com.example.data.local.BudgetEntity
+import com.example.data.local.CategoryEntity
+import com.example.data.local.CategoryRuleEntity
+import com.example.data.local.DefaultCategories
+import com.example.data.local.MasroofiDao
+import com.example.data.local.TransactionEntity
+import com.example.data.local.TransactionSource
+import com.example.data.local.TransactionType
+import com.example.data.preferences.AiProviderType
+import com.example.data.preferences.ApiKeyStatus
+import com.example.data.preferences.AppPreferencesRepository
+import com.example.data.preferences.AppPreferencesState
+import com.example.domain.MoneyUtils
+import com.example.domain.ai.AiParseResult
+import com.example.domain.ai.AiProviderClient
+import com.example.domain.ai.AiServiceException
+import com.example.domain.ai.EgyptianArabicLocalParser
+import com.example.domain.ai.ProposedTransactionDraft
+import com.example.domain.ai.RemoteAiProviderClient
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.Locale
+import java.util.UUID
+
+enum class RestoreMode {
+    REPLACE_ALL,
+    MERGE_BY_ID
+}
+
+/**
+ * Central repository coordinating local Room database persistence, user-controlled categories,
+ * learned category rules, AI provider orchestration, and atomic batch saves.
+ */
+class FinanceRepository(
+    private val dao: MasroofiDao,
+    val preferencesRepository: AppPreferencesRepository,
+    private val customAiClientOverride: AiProviderClient? = null,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default
+) {
+
+    val allCategoriesFlow: Flow<List<CategoryEntity>> = dao.observeAllCategories()
+    val allTransactionsFlow: Flow<List<TransactionEntity>> = dao.observeAllTransactions()
+    val allBudgetsFlow: Flow<List<BudgetEntity>> = dao.observeAllBudgets()
+    val categoryRulesFlow: Flow<List<CategoryRuleEntity>> = dao.observeCategoryRules()
+    val preferencesFlow: Flow<AppPreferencesState> = preferencesRepository.preferencesFlow
+
+    private val _selectedHomeYearMonthFlow = MutableStateFlow(MoneyUtils.currentYearMonth())
+    val selectedHomeYearMonthFlow: StateFlow<String> = _selectedHomeYearMonthFlow.asStateFlow()
+
+    fun setSelectedHomeYearMonth(yearMonth: String) {
+        if (yearMonth.isNotBlank()) {
+            _selectedHomeYearMonthFlow.value = yearMonth.trim()
+        }
+    }
+
+    fun observeApiKeyStatus(): Flow<ApiKeyStatus> =
+        preferencesRepository.observeApiKeyStatus(ioDispatcher)
+
+    suspend fun getProviderApiKey(provider: AiProviderType): String =
+        preferencesRepository.getProviderApiKey(provider, ioDispatcher)
+
+    suspend fun saveProviderApiKey(provider: AiProviderType, rawKey: String): Result<Unit> =
+        preferencesRepository.saveProviderApiKey(provider, rawKey, ioDispatcher)
+
+    suspend fun removeProviderApiKey(provider: AiProviderType) =
+        preferencesRepository.removeProviderApiKey(provider, ioDispatcher)
+
+    private var lastManualSaveSignature: String? = null
+    private var lastManualSaveTimestamp: Long = 0L
+
+    /**
+     * Seeds default Egyptian Arabic expense and income categories on first launch only.
+     * Users remain free to rename, archive, or remove defaults afterward.
+     */
+    suspend fun ensureDefaultCategoriesSeeded() {
+        val prefs = preferencesRepository.getSnapshot()
+        val existing = dao.getAllCategories()
+        if (!prefs.categoriesSeeded && existing.isEmpty()) {
+            dao.insertCategoriesIgnore(DefaultCategories.all())
+            preferencesRepository.markCategoriesSeeded()
+        } else if (!prefs.categoriesSeeded) {
+            preferencesRepository.markCategoriesSeeded()
+        }
+    }
+
+    // --- Manual Transaction Operations ---
+
+    /**
+     * Validates and saves a manual transaction with duplicate-submission protection.
+     * When editing an existing transaction (existingId != null), preserves its original
+     * currencyCode unless preserveExistingCurrency is explicitly set to false.
+     */
+    suspend fun saveManualTransaction(
+        existingId: String? = null,
+        description: String,
+        amountMinorUnits: Long,
+        currencyCode: String,
+        type: TransactionType,
+        categoryId: String?,
+        transactionDate: Long,
+        notes: String,
+        isRefundOffset: Boolean = false,
+        preserveExistingCurrency: Boolean = true,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Result<TransactionEntity> {
+        val cleanDesc = description.trim()
+        if (cleanDesc.isEmpty()) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال وصف المعاملة"))
+        }
+        if (amountMinorUnits <= 0L) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال مبلغ صحيح أكبر من الصفر"))
+        }
+
+        // Prevent accidental rapid double-tap duplicate submission for new entries
+        if (existingId == null) {
+            val signature = "$cleanDesc|$amountMinorUnits|$type|$categoryId|$transactionDate"
+            if (signature == lastManualSaveSignature && (nowMillis - lastManualSaveTimestamp) < 1500L) {
+                return Result.failure(IllegalArgumentException("تم حفظ هذه المعاملة بالفعل"))
+            }
+            lastManualSaveSignature = signature
+            lastManualSaveTimestamp = nowMillis
+        }
+
+        // Verify categoryId exists in database if provided
+        val verifiedCategoryId = if (categoryId != null) {
+            dao.getCategoryById(categoryId)?.id
+        } else {
+            null
+        }
+
+        val entity = if (existingId != null) {
+            val prev = dao.getTransactionById(existingId)
+            if (prev != null && verifiedCategoryId != null && prev.categoryId != verifiedCategoryId) {
+                rememberCategoryCorrection(
+                    description = cleanDesc,
+                    categoryId = verifiedCategoryId,
+                    transactionType = type
+                )
+            }
+            val effectiveCurrency = if (preserveExistingCurrency && prev != null) {
+                prev.currencyCode
+            } else {
+                currencyCode
+            }
+            TransactionEntity(
+                id = existingId,
+                description = cleanDesc,
+                amountMinorUnits = amountMinorUnits,
+                currencyCode = effectiveCurrency,
+                type = type,
+                categoryId = verifiedCategoryId,
+                transactionDate = transactionDate,
+                createdAt = prev?.createdAt ?: nowMillis,
+                updatedAt = nowMillis,
+                notes = notes.trim(),
+                source = prev?.source ?: TransactionSource.MANUAL,
+                batchOperationId = prev?.batchOperationId,
+                isRefundOffset = isRefundOffset
+            )
+        } else {
+            TransactionEntity(
+                id = UUID.randomUUID().toString(),
+                description = cleanDesc,
+                amountMinorUnits = amountMinorUnits,
+                currencyCode = currencyCode,
+                type = type,
+                categoryId = verifiedCategoryId,
+                transactionDate = transactionDate,
+                createdAt = nowMillis,
+                updatedAt = nowMillis,
+                notes = notes.trim(),
+                source = TransactionSource.MANUAL,
+                batchOperationId = null,
+                isRefundOffset = isRefundOffset
+            )
+        }
+
+        dao.upsertTransaction(entity)
+        return Result.success(entity)
+    }
+
+    suspend fun deleteTransaction(transactionId: String) {
+        dao.deleteTransactionById(transactionId)
+    }
+
+    // --- Batch AI Transaction Saving ---
+
+    /**
+     * Atomically saves a list of reviewed AI transaction drafts using a batchOperationId
+     * so retries never duplicate saved records. Also records any user category corrections
+     * as local CategoryRuleEntity preferences.
+     */
+    suspend fun saveReviewedBatchTransactions(
+        batchOperationId: String,
+        drafts: List<ProposedTransactionDraft>,
+        rememberCategoryRules: Boolean = true,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Result<Int> {
+        if (drafts.isEmpty()) {
+            return Result.failure(IllegalArgumentException("لا توجد معاملات لحفظها"))
+        }
+
+        val allCategoriesMap = dao.getAllCategories().associateBy { it.id }
+        val entities = mutableListOf<TransactionEntity>()
+
+        for (draft in drafts) {
+            val cleanDesc = draft.description.trim()
+            val minor = draft.amountMinorUnits
+            if (cleanDesc.isEmpty() || minor == null || minor <= 0L) {
+                return Result.failure(
+                    IllegalArgumentException("توجد معاملة بدون وصف أو بمبلغ غير صالح (${draft.description}).")
+                )
+            }
+            val dateMillis = com.example.domain.MoneyUtils.isoDateToEpochMillis(draft.isoDate)
+                ?: nowMillis
+
+            val verifiedCat = draft.categoryId?.let { allCategoriesMap[it] }
+            entities.add(
+                TransactionEntity(
+                    id = UUID.randomUUID().toString(),
+                    description = cleanDesc,
+                    amountMinorUnits = minor,
+                    currencyCode = draft.currencyCode,
+                    type = draft.type,
+                    categoryId = verifiedCat?.id,
+                    transactionDate = dateMillis,
+                    createdAt = nowMillis,
+                    updatedAt = nowMillis,
+                    notes = draft.notes.trim(),
+                    source = TransactionSource.AI_BATCH,
+                    batchOperationId = batchOperationId,
+                    isRefundOffset = draft.isRefundOffset
+                )
+            )
+
+            val isUserCorrectedOrConfirmed = draft.userConfirmedCategory ||
+                (draft.categoryId != draft.suggestedCategoryId)
+            if (rememberCategoryRules && verifiedCat != null && isUserCorrectedOrConfirmed) {
+                rememberCategoryCorrection(
+                    description = cleanDesc,
+                    categoryId = verifiedCat.id,
+                    transactionType = draft.type
+                )
+            }
+        }
+
+        val committed = dao.insertBatchWithIdempotency(batchOperationId, entities)
+        return if (committed) {
+            Result.success(entities.size)
+        } else {
+            Result.failure(IllegalStateException("تم حفظ هذه الدفعة مسبقاً ولن يتم تكرارها."))
+        }
+    }
+
+    suspend fun rememberCategoryCorrection(
+        description: String,
+        categoryId: String,
+        transactionType: TransactionType
+    ) {
+        val cleanKeyword = extractMeaningfulRuleKeyword(description)
+        if (cleanKeyword.length < 3) return
+        dao.upsertCategoryRule(
+            CategoryRuleEntity(
+                keyword = cleanKeyword,
+                categoryId = categoryId,
+                transactionType = transactionType,
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    private fun extractMeaningfulRuleKeyword(rawDescription: String): String {
+        val stopWords = setOf(
+            "اشتريت", "دفعت", "صرفت", "ركبت", "جبت", "حاسبت", "شحنت", "سددت", "كلت", "شربت",
+            "قبضت", "استلمت", "جالي", "حصلت", "من", "في", "على", "إلى", "الى", "عن", "مع",
+            "جنيه", "ج.م", "ريال", "دولار", "درهم", "يورو", "مصروف", "دخل", "معاملة"
+        )
+        val tokens = rawDescription
+            .lowercase(Locale.ROOT)
+            .replace(Regex("""\d+(?:\.\d+)?"""), " ")
+            .split(Regex("""[^\p{L}\p{N}]+"""))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it !in stopWords }
+
+        return tokens.joinToString(" ").trim()
+    }
+
+    // --- User-Controlled Category Management ---
+
+    suspend fun saveCategory(
+        existingId: String? = null,
+        name: String,
+        type: TransactionType,
+        iconName: String,
+        colorHex: Long,
+        isArchived: Boolean = false
+    ): Result<CategoryEntity> {
+        val cleanName = name.trim()
+        if (cleanName.isEmpty()) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال اسم التصنيف"))
+        }
+        val existing = existingId?.let { dao.getCategoryById(it) }
+        val entity = CategoryEntity(
+            id = existingId ?: "cat_${UUID.randomUUID().toString().take(8)}",
+            name = cleanName,
+            type = type,
+            iconName = iconName.ifBlank { "category" },
+            colorHex = colorHex,
+            isArchived = isArchived,
+            isDefault = existing?.isDefault ?: false,
+            createdAt = existing?.createdAt ?: System.currentTimeMillis()
+        )
+        dao.upsertCategory(entity)
+        return Result.success(entity)
+    }
+
+    suspend fun setCategoryArchived(categoryId: String, archived: Boolean) {
+        val existing = dao.getCategoryById(categoryId) ?: return
+        dao.upsertCategory(existing.copy(isArchived = archived))
+    }
+
+    /**
+     * Safely deletes a category. If transactions reference this category,
+     * ForeignKey.SET_NULL preserves all transaction history cleanly by setting their
+     * categoryId to null (Uncategorized), never destroying financial records.
+     */
+    suspend fun deleteCategorySafely(categoryId: String): Int {
+        val linkedCount = dao.countTransactionsForCategory(categoryId)
+        dao.deleteCategoryById(categoryId)
+        return linkedCount
+    }
+
+    suspend fun countTransactionsForCategory(categoryId: String): Int {
+        return dao.countTransactionsForCategory(categoryId)
+    }
+
+    // --- Budgets ---
+
+    suspend fun saveBudget(
+        yearMonth: String,
+        categoryId: String?,
+        limitMinorUnits: Long
+    ): Result<BudgetEntity> {
+        if (limitMinorUnits <= 0L) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال قيمة ميزانية أكبر من الصفر"))
+        }
+        val id = if (categoryId == null) {
+            "${yearMonth}_OVERALL"
+        } else {
+            "${yearMonth}_$categoryId"
+        }
+        val budget = BudgetEntity(
+            id = id,
+            yearMonth = yearMonth,
+            categoryId = categoryId,
+            limitMinorUnits = limitMinorUnits,
+            updatedAt = System.currentTimeMillis()
+        )
+        dao.upsertBudget(budget)
+        return Result.success(budget)
+    }
+
+    suspend fun deleteBudget(budgetId: String) {
+        dao.deleteBudgetById(budgetId)
+    }
+
+    // --- AI Parsing & Provider Orchestration ---
+
+    suspend fun parseMultiTransactionsWithAi(
+        userText: String,
+        todayIsoDate: String,
+        useLocalParserOnly: Boolean = false
+    ): Result<AiParseResult> {
+        val (prefs, activeCategories, learnedRules, configuredApiKey) = withContext(ioDispatcher) {
+            val snapshot = preferencesRepository.getSnapshot()
+            val categories = dao.getActiveCategories()
+            val rules = dao.getAllCategoryRules()
+            val key = if (snapshot.aiEnabled && !useLocalParserOnly) {
+                preferencesRepository.getProviderApiKey(snapshot.selectedProvider, ioDispatcher)
+            } else {
+                ""
+            }
+            Quadruple(snapshot, categories, rules, key)
+        }
+
+        if (!prefs.aiEnabled) {
+            return Result.failure(
+                IllegalStateException("ميزة الذكاء الاصطناعي متوقفة حالياً من الإعدادات. يمكنك تفعيلها في أي وقت.")
+            )
+        }
+
+        if (useLocalParserOnly) {
+            val localRes = withContext(defaultDispatcher) {
+                EgyptianArabicLocalParser.parseNaturalText(
+                    rawText = userText,
+                    todayIsoDate = todayIsoDate,
+                    defaultCurrency = prefs.currencyCode,
+                    eligibleCategories = activeCategories,
+                    learnedRules = learnedRules,
+                    refundAccountingMode = prefs.refundAccountingMode
+                )
+            }
+            return Result.success(localRes)
+        }
+
+        val modelId = when (prefs.selectedProvider) {
+            AiProviderType.GEMINI -> prefs.geminiModelId
+            AiProviderType.OPENROUTER -> prefs.openRouterModelId
+        }
+
+        // If a custom test client override is injected, or if the user configured an API key, call the remote provider
+        if (customAiClientOverride != null || configuredApiKey.isNotEmpty()) {
+            val client = customAiClientOverride ?: RemoteAiProviderClient(
+                providerType = prefs.selectedProvider,
+                apiKeyProvider = { configuredApiKey },
+                modelIdProvider = { modelId }
+            )
+            val providerLabel = when (prefs.selectedProvider) {
+                AiProviderType.GEMINI -> "Google Gemini ($modelId)"
+                AiProviderType.OPENROUTER -> "OpenRouter ($modelId)"
+            }
+            val rawJsonResult = withContext(ioDispatcher) {
+                client.requestStructuredTransactionsJson(
+                    userText = userText,
+                    todayIsoDate = todayIsoDate,
+                    defaultCurrency = prefs.currencyCode,
+                    eligibleCategories = activeCategories
+                )
+            }
+            return rawJsonResult.fold(
+                onSuccess = { rawJson ->
+                    withContext(defaultDispatcher) {
+                        val validated = EgyptianArabicLocalParser.validateAndMapAiJsonResponse(
+                            rawJsonResponse = rawJson,
+                            todayIsoDate = todayIsoDate,
+                            defaultCurrency = prefs.currencyCode,
+                            eligibleCategories = activeCategories,
+                            learnedRules = learnedRules,
+                            providerLabel = providerLabel,
+                            refundAccountingMode = prefs.refundAccountingMode
+                        )
+                        // Deterministic local date resolution always takes precedence over dates
+                        // calculated by the remote model (no extra network request is made).
+                        validated.map { remoteResult ->
+                            val localDates = EgyptianArabicLocalParser.parseNaturalText(
+                                rawText = userText,
+                                todayIsoDate = todayIsoDate,
+                                defaultCurrency = prefs.currencyCode,
+                                eligibleCategories = activeCategories,
+                                learnedRules = learnedRules,
+                                refundAccountingMode = prefs.refundAccountingMode
+                            )
+                            EgyptianArabicLocalParser.reconcileRemoteDatesWithLocal(
+                                remoteResult = remoteResult,
+                                localResult = localDates,
+                                todayIsoDate = todayIsoDate
+                            )
+                        }
+                    }
+                },
+                onFailure = { err ->
+                    if (err is CancellationException) throw err
+                    Result.failure(err)
+                }
+            )
+        }
+
+        // When no remote API key is configured yet, use the deterministic local Egyptian Arabic parser
+        val localResult = withContext(defaultDispatcher) {
+            EgyptianArabicLocalParser.parseNaturalText(
+                rawText = userText,
+                todayIsoDate = todayIsoDate,
+                defaultCurrency = prefs.currencyCode,
+                eligibleCategories = activeCategories,
+                learnedRules = learnedRules,
+                refundAccountingMode = prefs.refundAccountingMode
+            )
+        }
+        return Result.success(localResult)
+    }
+
+    private data class Quadruple<A, B, C, D>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D
+    )
+
+    suspend fun generateSmartSummary(aggregatedFactsArabic: String): Result<String> = withContext(ioDispatcher) {
+        val prefs = preferencesRepository.getSnapshot()
+        if (!prefs.aiEnabled || !prefs.aiSummaryEnabled) {
+            return@withContext Result.failure(IllegalStateException("ميزة الملخص الذكي غير مفعلة في الإعدادات."))
+        }
+        val apiKey = preferencesRepository.getProviderApiKey(prefs.selectedProvider, ioDispatcher)
+        val modelId = when (prefs.selectedProvider) {
+            AiProviderType.GEMINI -> prefs.geminiModelId
+            AiProviderType.OPENROUTER -> prefs.openRouterModelId
+        }
+
+        if (customAiClientOverride != null || apiKey.isNotEmpty()) {
+            val client = customAiClientOverride ?: RemoteAiProviderClient(
+                providerType = prefs.selectedProvider,
+                apiKeyProvider = { apiKey },
+                modelIdProvider = { modelId }
+            )
+            return@withContext client.requestSmartSummaryText(aggregatedFactsArabic)
+        }
+
+        Result.success(
+            "ملخص محلي محسوب من سجلاتك:\n$aggregatedFactsArabic\n(أضف مفتاح API في الإعدادات للحصول على صياغة تحليلية إضافية عبر الذكاء الاصطناعي)."
+        )
+    }
+
+    suspend fun testProviderConnection(
+        provider: AiProviderType,
+        apiKey: String,
+        modelId: String
+    ): Result<String> = withContext(ioDispatcher) {
+        val client = customAiClientOverride ?: RemoteAiProviderClient(
+            providerType = provider,
+            apiKeyProvider = { apiKey.trim() },
+            modelIdProvider = { modelId.trim() }
+        )
+        client.testConnection()
+    }
+
+    // --- Backup & Restore ---
+
+    suspend fun createBackupJson(): String {
+        val prefs = preferencesRepository.getSnapshot()
+        val categories = dao.getAllCategories()
+        val transactions = dao.getAllTransactions()
+        val budgets = dao.getAllBudgets()
+        val rules = dao.getAllCategoryRules()
+
+        return BackupExportManager.createBackupJsonString(
+            currencyCode = prefs.currencyCode,
+            openingBalanceMinorUnits = prefs.openingBalanceMinorUnits,
+            openingBalanceConfigured = prefs.openingBalanceConfigured,
+            refundMode = prefs.refundAccountingMode,
+            categories = categories,
+            transactions = transactions,
+            budgets = budgets,
+            categoryRules = rules,
+            currencyOpeningBalances = prefs.configuredOpeningBalances
+        )
+    }
+
+    suspend fun applyValidatedBackup(
+        payload: BackupPayload,
+        mode: RestoreMode
+    ): Result<Unit> {
+        return try {
+            when (mode) {
+                RestoreMode.REPLACE_ALL -> {
+                    dao.replaceAllDataTransaction(
+                        categories = payload.categories,
+                        transactions = payload.transactions,
+                        budgets = payload.budgets,
+                        rules = payload.categoryRules
+                    )
+                }
+                RestoreMode.MERGE_BY_ID -> {
+                    dao.mergeBackupDataTransaction(
+                        categories = payload.categories,
+                        transactions = payload.transactions,
+                        budgets = payload.budgets,
+                        rules = payload.categoryRules
+                    )
+                }
+            }
+            preferencesRepository.restoreBackupSettings(
+                currencyCode = payload.currencyCode,
+                openingBalanceMinorUnits = payload.openingBalanceMinorUnits,
+                openingBalanceConfigured = payload.openingBalanceConfigured,
+                refundMode = payload.refundAccountingMode,
+                currencyOpeningBalances = payload.currencyOpeningBalances,
+                replaceExistingBalances = (mode == RestoreMode.REPLACE_ALL)
+            )
+            Result.success(Unit)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            Result.failure(IllegalStateException("فشل استعادة النسخة الاحتياطية بأمان: ${e.message}"))
+        }
+    }
+
+    suspend fun exportCsvString(): String {
+        val categoriesMap = dao.getAllCategories().associateBy { it.id }
+        val transactions = dao.getAllTransactions()
+        return BackupExportManager.exportTransactionsToCsv(transactions, categoriesMap)
+    }
+}
